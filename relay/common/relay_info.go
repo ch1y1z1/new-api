@@ -177,6 +177,17 @@ type RelayInfo struct {
 	*RerankerInfo
 	*ResponsesUsageInfo
 	*ChannelMeta
+
+	// OriginalResponsesInstructions stores the instructions field from the
+	// original Responses API request so it can be echoed back in the response.
+	OriginalResponsesInstructions json.RawMessage
+	// OriginalResponsesMetadata stores the metadata field from the original
+	// Responses API request so it can be echoed back in the response.
+	OriginalResponsesMetadata json.RawMessage
+	// IsResponsesConvertedToChat indicates that the original Responses API request
+	// has been converted to a Chat Completions request because the upstream channel
+	// does not natively support the Responses API.
+	IsResponsesConvertedToChat bool
 	*TaskRelayInfo
 }
 
@@ -378,6 +389,10 @@ func GenRelayInfoResponses(c *gin.Context, request *dto.OpenAIResponsesRequest) 
 	info := genBaseRelayInfo(c, request)
 	info.RelayMode = relayconstant.RelayModeResponses
 	info.RelayFormat = types.RelayFormatOpenAIResponses
+
+	// Preserve original instructions and metadata for echoing back in responses.
+	info.OriginalResponsesInstructions = request.Instructions
+	info.OriginalResponsesMetadata = request.Metadata
 
 	info.ResponsesUsageInfo = &ResponsesUsageInfo{
 		BuiltInTools: make(map[string]*BuildInToolInfo),

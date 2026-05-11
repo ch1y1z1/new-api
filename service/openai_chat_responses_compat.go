@@ -1,6 +1,8 @@
 package service
 
 import (
+	"encoding/json"
+
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/service/openaicompat"
 )
@@ -15,4 +17,12 @@ func ResponsesResponseToChatCompletionsResponse(resp *dto.OpenAIResponsesRespons
 
 func ExtractOutputTextFromResponses(resp *dto.OpenAIResponsesResponse) string {
 	return openaicompat.ExtractOutputTextFromResponses(resp)
+}
+
+func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, responseId string, instructions json.RawMessage, metadata json.RawMessage) (*dto.OpenAIResponsesResponse, error) {
+	return openaicompat.ChatCompletionsResponseToResponsesResponse(resp, responseId, instructions, metadata)
+}
+
+func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (*dto.GeneralOpenAIRequest, error) {
+	return openaicompat.ResponsesRequestToChatCompletionsRequest(req)
 }
