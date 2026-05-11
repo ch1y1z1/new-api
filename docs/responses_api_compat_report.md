@@ -21,7 +21,7 @@ against the OpenAI official spec and litellm's implementation.
 | `developer` role → `system` | Required for non-o1 models | Supported | Supported | |
 | `previous_response_id` | Not convertible | Error | Error | Correct: no Chat Completions equivalent |
 | `conversation` | Not convertible | Error | Error | Correct: no Chat Completions equivalent |
-| Built-in tools (web_search, file_search) | Not convertible | Skipped | Skipped (warned) | Correct: silently skip for Codex CLI compat |
+| Built-in tools (web_search, file_search) | `web_search_preview` → `web_search_options` | Skipped (P1 mapped) | P1 mapped, others skipped | |
 | `max_output_tokens` → `max_completion_tokens` | Field rename | Supported | Supported | |
 | `reasoning.effort` → `reasoning_effort` | Field rename | Supported | Supported | |
 | `reasoning.summary` | Responses-only | Not mapped | Not mapped | No Chat Completions equivalent |
@@ -96,40 +96,37 @@ These are intentional design choices or features that don't have Chat Completion
 - **Native image generation** — Not part of this conversion layer
 - **Audio output items** — Not yet handled in response conversion
 
-## Web Search Handling Analysis
+## Web Search Handling
 
-### litellm's Approach
+### Implementation Status
 
-litellm has a comprehensive web search handling chain:
+| Capability | Status |
+|------------|--------|
+| `web_search_preview` / `web_search` → `web_search_options` | **Implemented (P1)** |
+| `url_citation` / annotations passthrough | **Implemented (P2)** |
+| `web_search_call` input items → tool messages | **Implemented (P3)** |
 
-1. **Request: `web_search_preview` → `web_search_options`** — Converts the Responses API `web_search_preview` tool into the Chat Completions `web_search_options` top-level parameter (with `search_context_size` and `user_location`). OpenAI's Chat Completions API supports this parameter natively.
+### P1: Web Search Options Passthrough
 
-2. **Response: `annotations` / `url_citation` passthrough** — When Chat Completions returns `annotations` with `url_citation` on message content, litellm converts them to Responses API `response.output_text.annotation.added` stream events and populates `output_text` content part `annotations` arrays.
+When converting a Responses API request to Chat Completions, `web_search_preview` and
+`web_search` tool types are extracted and set as `WebSearchOptions` on the Chat Completions
+request. This allows OpenAI-compatible upstreams that support `web_search_options` natively
+to handle the search. Fields `search_context_size` and `user_location` are forwarded.
 
-3. **Input: `web_search_call` items** — When `web_search_call` appears in Responses API input (conversation history), litellm treats it as a tool message (`role=tool`) to preserve search context across turns.
+### P2: Annotations Passthrough
 
-4. **WebSearchInterception** — For providers without native web search (e.g., Bedrock/Claude), litellm intercepts `web_search_preview`, converts it to a `litellm_web_search` function call, executes the search via a built-in search function, and injects results as a tool message.
+When the upstream returns `url_citation` annotations on message content (e.g. from OpenAI
+with web search enabled), they are forwarded to the Responses API output in both
+non-streaming and streaming conversion paths.
 
-### Current new-api Gaps
+### P3: Web Search Call Input Items
 
-| Capability | litellm | new-api (current) |
-|------------|---------|-------------------|
-| `web_search_preview` → `web_search_options` | Converted | Dropped silently |
-| `url_citation` / annotations passthrough | Full support | DTO field exists but never populated |
-| `web_search_call` input items | Converted to tool message | Ignored |
-| Web search interception for non-native providers | WebSearchInterception | None |
+When `web_search_call` items appear in Responses API input (conversation history for
+multi-turn), they are converted to tool messages (`role=tool`) to preserve search context
+across turns.
 
-### Planned Improvements (P1–P4)
+### litellm Comparison
 
-- **P1**: Convert `web_search_preview` tool → `web_search_options` parameter for OpenAI-compatible upstreams
-- **P2**: Passthrough `url_citation` annotations from Chat Completions responses to Responses API output
-- **P3**: Handle `web_search_call` input items as tool messages in multi-turn conversations
-- **P4**: WebSearchInterception with configurable search providers (Tavily, Brave, SearXNG) for non-native upstreams
-
-### Search Provider API Reference
-
-| Provider | Endpoint | Auth | Query Field | Result Fields |
-|----------|----------|------|-------------|---------------|
-| Tavily | `POST https://api.tavily.com/search` | `Authorization: Bearer <key>` | `query` (body) | `results[].title/url/content/score` |
-| Brave | `GET https://api.search.brave.com/res/v1/web/search` | `X-Subscription-Token: <key>` | `q` (param) | `web.results[].title/url/description` |
-| SearXNG | `GET <base_url>/search?format=json` | None (self-hosted) | `q` (param) | `results[].title/url/content/score` |
+litellm also implements a WebSearchInterception feature (P4) that intercepts web search
+for providers without native support and executes searches via Tavily/Brave. new-api does
+not implement P4 — web search interception is left to the upstream provider or client.

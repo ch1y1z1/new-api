@@ -620,12 +620,6 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 			return nil, err
 		}
 		info.IsResponsesConvertedToChat = true
-			// Intercept web search if the upstream doesn't support it natively.
-			if chatReq.WebSearchOptions != nil {
-				if interceptErr := service.ApplyWebSearchInterception(chatReq, info); interceptErr != nil {
-					logger.LogWarn(c, "web_search interception failed: "+interceptErr.Error())
-				}
-			}
 		return chatReq, nil
 	}
 	return request, nil
