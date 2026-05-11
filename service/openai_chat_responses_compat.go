@@ -5,6 +5,7 @@ import (
 
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/service/openaicompat"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 )
 
 func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*dto.OpenAIResponsesRequest, error) {
@@ -25,4 +26,8 @@ func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, re
 
 func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (*dto.GeneralOpenAIRequest, error) {
 	return openaicompat.ResponsesRequestToChatCompletionsRequest(req)
+}
+
+func ApplyWebSearchInterception(chatReq *dto.GeneralOpenAIRequest, info *relaycommon.RelayInfo) error {
+	return openaicompat.ApplyWebSearchInterception(chatReq, info)
 }

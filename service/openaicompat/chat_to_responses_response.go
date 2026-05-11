@@ -40,6 +40,19 @@ func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, re
 		status = "failed"
 	}
 
+	// Map finish_reason to incomplete status per OpenAI spec.
+	var incompleteReason string
+	if len(resp.Choices) > 0 {
+		switch resp.Choices[0].FinishReason {
+		case "length":
+			status = "incomplete"
+			incompleteReason = "max_output_tokens"
+		case "content_filter":
+			status = "incomplete"
+			incompleteReason = "content_filter"
+		}
+	}
+
 	out := &dto.OpenAIResponsesResponse{
 		ID:        responseId,
 		Object:    "response",
@@ -50,14 +63,8 @@ func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, re
 		Usage:     usage,
 	}
 
-	// Set incomplete_details based on finish reason.
-	if len(resp.Choices) > 0 {
-		switch resp.Choices[0].FinishReason {
-		case "length":
-			out.IncompleteDetails = &dto.IncompleteDetails{Reasoning: "max_output_tokens"}
-		case "content_filter":
-			out.IncompleteDetails = &dto.IncompleteDetails{Reasoning: "content_filter"}
-		}
+	if incompleteReason != "" {
+		out.IncompleteDetails = &dto.IncompleteDetails{Reasoning: incompleteReason}
 	}
 
 	// Echo back instructions and metadata from the original Responses API request.
@@ -80,7 +87,17 @@ func buildResponsesOutputFromChatResponse(resp *dto.OpenAITextResponse) []dto.Re
 	var output []dto.ResponsesOutput
 
 	// Reasoning output item (must appear before message per OpenAI spec).
+	// Try the dedicated field first, then fall back to reasoning_text parts
+	// in array content (some providers embed reasoning there).
 	reasoningText := msg.GetReasoningContent()
+	if reasoningText == "" && !msg.IsStringContent() {
+		for _, part := range msg.ParseContent() {
+			if part.Type == "reasoning_text" && strings.TrimSpace(part.Text) != "" {
+				reasoningText = part.Text
+				break
+			}
+		}
+	}
 	if reasoningText != "" {
 		output = append(output, dto.ResponsesOutput{
 			Type:   "reasoning",
@@ -146,6 +163,12 @@ func buildResponsesContentFromChatContent(msg dto.Message) []dto.ResponsesOutput
 		return nil
 	}
 
+	// Parse annotations from the message if present.
+	var annotations []interface{}
+	if len(msg.Annotations) > 0 {
+		_ = common.Unmarshal(msg.Annotations, &annotations)
+	}
+
 	// String content → single output_text part.
 	if msg.IsStringContent() {
 		text := strings.TrimSpace(msg.StringContent())
@@ -153,7 +176,7 @@ func buildResponsesContentFromChatContent(msg dto.Message) []dto.ResponsesOutput
 			return nil
 		}
 		return []dto.ResponsesOutputContent{
-			{Type: "output_text", Text: text},
+			{Type: "output_text", Text: text, Annotations: annotations},
 		}
 	}
 
@@ -171,6 +194,12 @@ func buildResponsesContentFromChatContent(msg dto.Message) []dto.ResponsesOutput
 			}
 		}
 	}
+
+	// Attach annotations to the first output_text part if present.
+	if len(annotations) > 0 && len(result) > 0 {
+		result[0].Annotations = annotations
+	}
+
 	return result
 }
 

@@ -77,6 +77,7 @@ func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (
 		return nil, fmt.Errorf("failed to convert input to messages: %w", err)
 	}
 
+
 	// Prepend instructions as a system/developer message.
 	if len(req.Instructions) > 0 {
 		var instructions string
@@ -144,7 +145,7 @@ func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (
 	out.ResponseFormat = convertResponsesTextToResponseFormat(req.Text)
 
 	// Tools (flat) → Tools (nested)
-	out.Tools = convertResponsesToolsToChatTools(req.Tools)
+	out.Tools, out.WebSearchOptions = convertResponsesToolsToChatTools(req.Tools)
 
 	// ToolChoice (flat) → ToolChoice (nested)
 	out.ToolChoice = convertResponsesToolChoiceToChatToolChoice(req.ToolChoice)
@@ -188,6 +189,10 @@ func convertResponsesInputToMessages(req *dto.OpenAIResponsesRequest) ([]dto.Mes
 	// Track the last assistant message index so function_call items can
 	// attach tool_calls to it.
 	lastAssistantIdx := -1
+	// Pending reasoning content from a "reasoning" input item.
+	// It must be attached to the next assistant message so that providers
+	// in thinking mode (e.g. DeepSeek) can validate reasoning_content continuity.
+	var pendingReasoningContent string
 
 	for _, itemRaw := range items {
 		var item map[string]any
@@ -228,6 +233,12 @@ func convertResponsesInputToMessages(req *dto.OpenAIResponsesRequest) ([]dto.Mes
 			messages = append(messages, msg)
 			if role == "assistant" {
 				lastAssistantIdx = len(messages) - 1
+				// Attach any pending reasoning content from a preceding
+				// "reasoning" input item (required by DeepSeek thinking mode).
+				if pendingReasoningContent != "" {
+					rc := pendingReasoningContent
+					messages[lastAssistantIdx].ReasoningContent = &rc
+				}
 			}
 			continue
 		}
@@ -255,6 +266,10 @@ func convertResponsesInputToMessages(req *dto.OpenAIResponsesRequest) ([]dto.Mes
 			// Ensure an assistant message exists to attach the tool_call.
 			if lastAssistantIdx < 0 || messages[lastAssistantIdx].Role != "assistant" {
 				assistantMsg := dto.Message{Role: "assistant", Content: ""}
+					if pendingReasoningContent != "" {
+						assistantMsg.ReasoningContent = &pendingReasoningContent
+						pendingReasoningContent = ""
+					}
 				messages = append(messages, assistantMsg)
 				lastAssistantIdx = len(messages) - 1
 			}
@@ -290,6 +305,53 @@ func convertResponsesInputToMessages(req *dto.OpenAIResponsesRequest) ([]dto.Mes
 				Role:       "tool",
 				Content:    output,
 				ToolCallId: callId,
+			})
+
+		case "reasoning":
+			// Extract reasoning text from a previous turn's reasoning output item.
+			// DeepSeek thinking mode requires reasoning_content to be passed back.
+			var reasoningText string
+			// Try content array first (reasoning_text parts).
+			if contentArr, ok := item["content"].([]any); ok {
+				for _, partAny := range contentArr {
+					if part, ok := partAny.(map[string]any); ok {
+						if t, _ := part["type"].(string); t == "reasoning_text" {
+							if txt, _ := part["text"].(string); txt != "" {
+								reasoningText += txt
+							}
+						}
+					}
+				}
+			}
+			// Fallback: try summary array.
+			if reasoningText == "" {
+				if summaryArr, ok := item["summary"].([]any); ok {
+					for _, partAny := range summaryArr {
+						if part, ok := partAny.(map[string]any); ok {
+							if t, _ := part["type"].(string); t == "summary_text" {
+								if txt, _ := part["text"].(string); txt != "" {
+									reasoningText += txt
+								}
+							}
+						}
+					}
+				}
+			}
+			if reasoningText != "" {
+				pendingReasoningContent = reasoningText
+			}
+
+		case "web_search_call":
+			wsCallId, _ := item["id"].(string)
+			if wsCallId == "" {
+				wsCallId, _ = item["call_id"].(string)
+			}
+			wsQuery, _ := item["query"].(string)
+			wsContent := fmt.Sprintf("[Web search performed: %s]", wsQuery)
+			messages = append(messages, dto.Message{
+				Role:       "tool",
+				Content:    wsContent,
+				ToolCallId: wsCallId,
 			})
 
 		case "input_text":
@@ -445,7 +507,15 @@ func convertResponsesTextToResponseFormat(textRaw json.RawMessage) *dto.Response
 
 	out := &dto.ResponseFormat{Type: formatType}
 
-	if formatType == "json_schema" {
+	switch formatType {
+	case "json_object":
+		// Responses: {"format":{"type":"json_object"}}
+		// Chat:      {"type":"json_object"}
+		return out
+	case "text":
+		// No format enforcement needed for plain text.
+		return nil
+	case "json_schema":
 		// Reconstruct the json_schema nested structure.
 		// In Responses: {"format":{"type":"json_schema","name":"...","schema":{...},...}}
 		// In Chat:       {"type":"json_schema","json_schema":{"name":"...","schema":{...},...}}
@@ -469,23 +539,25 @@ func convertResponsesTextToResponseFormat(textRaw json.RawMessage) *dto.Response
 // (flat: {"type":"function","name":"...","description":"...","parameters":...})
 // to Chat Completions tools (nested: {"type":"function","function":{"name":"...",...}}).
 // Inverse of the tool conversion in ChatCompletionsRequestToResponsesRequest.
-func convertResponsesToolsToChatTools(toolsRaw json.RawMessage) []dto.ToolCallRequest {
+func convertResponsesToolsToChatTools(toolsRaw json.RawMessage) ([]dto.ToolCallRequest, *dto.WebSearchOptions) {
 	if len(toolsRaw) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	var toolsMap []map[string]any
 	if err := common.Unmarshal(toolsRaw, &toolsMap); err != nil {
-		return nil
+		return nil, nil
 	}
 
+	var webSearchOpts *dto.WebSearchOptions
 	result := make([]dto.ToolCallRequest, 0, len(toolsMap))
 	for _, toolMap := range toolsMap {
 		toolType, _ := toolMap["type"].(string)
-		if toolType == "function" {
+		switch toolType {
+		case "function":
 			name, _ := toolMap["name"].(string)
 			description, _ := toolMap["description"].(string)
-			parameters := toolMap["parameters"]
+			parameters := enforceParameterTypeObject(toolMap["parameters"])
 
 			result = append(result, dto.ToolCallRequest{
 				Type: "function",
@@ -495,13 +567,27 @@ func convertResponsesToolsToChatTools(toolsRaw json.RawMessage) []dto.ToolCallRe
 					Parameters:  parameters,
 				},
 			})
-		} else {
-			// Non-function tools (web_search, file_search, etc.) have no
-			// Chat Completions equivalent. Skip them silently; the warning
-			// was already emitted in ValidateResponsesRequestForConversion.
+		case "web_search_preview", "web_search":
+			if webSearchOpts == nil {
+				webSearchOpts = &dto.WebSearchOptions{}
+			}
+			if scs, ok := toolMap["search_context_size"].(string); ok && scs != "" {
+				webSearchOpts.SearchContextSize = scs
+			} else if webSearchOpts.SearchContextSize == "" {
+				webSearchOpts.SearchContextSize = "medium"
+			}
+			if ul, ok := toolMap["user_location"]; ok && ul != nil {
+				raw, err := common.Marshal(ul)
+				if err == nil {
+					webSearchOpts.UserLocation = json.RawMessage(raw)
+				}
+			}
+		default:
+			// Other built-in tools (file_search, etc.) have no Chat Completions
+			// equivalent. Skip them silently.
 		}
 	}
-	return result
+	return result, webSearchOpts
 }
 
 // convertResponsesToolChoiceToChatToolChoice converts Responses API tool_choice
@@ -559,4 +645,16 @@ func ptrBool(v bool) *bool {
 	return &v
 }
 
-
+// enforceParameterTypeObject ensures that function tool parameters have
+// {"type": "object"} when missing. Chat Completions requires this;
+// Responses API tools may omit it.
+func enforceParameterTypeObject(params any) any {
+	m, ok := params.(map[string]any)
+	if !ok || m == nil {
+		return params
+	}
+	if _, exists := m["type"]; !exists {
+		m["type"] = "object"
+	}
+	return m
+}

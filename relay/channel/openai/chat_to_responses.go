@@ -85,6 +85,7 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		sentStop    bool
 		sawToolCall bool
 		sawReasoning bool
+		reasoningItemIDSaved string
 
 		// Reasoning item tracking.
 		reasoningItemID string
@@ -93,6 +94,7 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 
 		// Assistant message item tracking.
 		messageItemID string
+		messageItemIDSaved string
 		outputIndex   int
 		contentIndex  int
 
@@ -103,16 +105,73 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		toolCallAccumIndex int
 		toolCallArgs       = make(map[int]string) // chat index → accumulated arguments
 		outputText         strings.Builder
+			annotations        []interface{}
 	)
 
+	seqNum := 0
+
 	// sendEvent sends a Responses API SSE event using the event+data format.
+	// A monotonically increasing sequence_number is injected into every event
+	// per the OpenAI Responses API streaming spec.
 	sendEvent := func(eventType string, payload any) bool {
+		seqNum++
+		// Inject sequence_number into the payload map.
+		if m, ok := payload.(map[string]any); ok {
+			m["sequence_number"] = seqNum
+		}
 		data, err := common.Marshal(payload)
 		if err != nil {
 			streamErr = types.NewOpenAIError(err, types.ErrorCodeJsonMarshalFailed, http.StatusInternalServerError)
 			return false
 		}
-		helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: eventType}, string(data))
+		helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: eventType, SequenceNumber: seqNum}, string(data))
+		return true
+	}
+
+	// closeReasoningItem emits the done events for the reasoning output item
+	// if it is still open. Returns false on send error.
+	closeReasoningItem := func() bool {
+		if reasoningItemID == "" {
+			return true
+		}
+		oi := outputIndex
+		si := summaryIndex
+		fullText := reasoningText.String()
+		if !sendEvent("response.reasoning_summary_text.done", map[string]any{
+			"type":          "response.reasoning_summary_text.done",
+			"output_index":  oi,
+			"summary_index": si,
+			"item_id":       reasoningItemID,
+			"text":          fullText,
+		}) {
+			return false
+		}
+		if !sendEvent("response.reasoning_summary_part.done", map[string]any{
+			"type":          "response.reasoning_summary_part.done",
+			"output_index":  oi,
+			"summary_index": si,
+			"item_id":       reasoningItemID,
+			"part": map[string]any{
+				"type": "summary_text",
+				"text": fullText,
+			},
+		}) {
+			return false
+		}
+		if !sendEvent("response.output_item.done", map[string]any{
+			"type":        "response.output_item.done",
+			"output_index": oi,
+			"item": map[string]any{
+				"type":    "reasoning",
+				"id":      reasoningItemID,
+				"summary": []map[string]any{{"type": "summary_text", "text": fullText}},
+				"status":  "completed",
+			},
+		}) {
+			return false
+		}
+			reasoningItemIDSaved = reasoningItemID
+		reasoningItemID = ""
 		return true
 	}
 
@@ -181,6 +240,9 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		if delta == "" {
 			return true
 		}
+		if !closeReasoningItem() {
+			return false
+		}
 		if !ensureCreated() || !ensureMessageItem() {
 			return false
 		}
@@ -219,7 +281,7 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 					"type":    "reasoning",
 					"id":      reasoningItemID,
 					"status":  "in_progress",
-					"summary": nil,
+					"summary": []any{},
 				},
 			}) {
 				return false
@@ -252,11 +314,15 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		})
 	}
 
+
 	sendToolCallItem := func(chatIndex int, callID string, name string, argsDelta string) bool {
 		if !ensureCreated() {
 			return false
 		}
 
+			if !closeReasoningItem() {
+				return false
+			}
 		_, exists := toolCallItemIDs[chatIndex]
 		if !exists {
 			itemID := "fc_" + common.GetRandomString(8)
@@ -299,46 +365,12 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			msgOutputIndex = outputIndex + 1
 		}
 
-		// Close reasoning item if active.
-		if reasoningItemID != "" {
-			oi := outputIndex
-			si := summaryIndex
-			fullText := reasoningText.String()
-			if !sendEvent("response.reasoning_summary_text.done", map[string]any{
-				"type":          "response.reasoning_summary_text.done",
-				"output_index":  oi,
-				"summary_index": si,
-				"item_id":       reasoningItemID,
-				"text":          fullText,
-			}) {
+			// Close reasoning item if still open (fallback for streams
+			// that end during reasoning; normally closeReasoningItem
+			// is called earlier when content/tool_call deltas arrive).
+			if !closeReasoningItem() {
 				return false
 			}
-			if !sendEvent("response.reasoning_summary_part.done", map[string]any{
-				"type":          "response.reasoning_summary_part.done",
-				"output_index":  oi,
-				"summary_index": si,
-				"item_id":       reasoningItemID,
-				"part": map[string]any{
-					"type": "summary_text",
-					"text": fullText,
-				},
-			}) {
-				return false
-			}
-			if !sendEvent("response.output_item.done", map[string]any{
-				"type":        "response.output_item.done",
-				"output_index": oi,
-				"item": map[string]any{
-					"type":    "reasoning",
-					"id":      reasoningItemID,
-					"summary": []map[string]any{{"type": "summary_text", "text": fullText}},
-					"status":  "completed",
-				},
-			}) {
-				return false
-			}
-			reasoningItemID = ""
-		}
 
 		// Close the message content part if active.
 		if messageItemID != "" {
@@ -359,6 +391,7 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				"part": map[string]any{
 					"type": "output_text",
 					"text": outputText.String(),
+					"annotations": annotations,
 				},
 			}) {
 				return false
@@ -370,12 +403,13 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 					"type":    "message",
 					"id":      messageItemID,
 					"role":    "assistant",
-					"content": []map[string]any{{"type": "output_text", "text": outputText.String()}},
+					"content": []map[string]any{{"type": "output_text", "text": outputText.String(), "annotations": annotations}},
 					"status":  "completed",
 				},
 			}) {
 				return false
 			}
+			messageItemIDSaved = messageItemID
 			messageItemID = ""
 		}
 
@@ -417,7 +451,7 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		if sawReasoning {
 			finalOutput = append(finalOutput, map[string]any{
 				"type":    "reasoning",
-				"id":      "rs_" + common.GetRandomString(8),
+				"id":      reasoningItemIDSaved,
 				"summary": []map[string]any{{"type": "summary_text", "text": reasoningText.String()}},
 				"status":  "completed",
 			})
@@ -426,7 +460,8 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			finalOutput = append(finalOutput, map[string]any{
 				"type":    "message",
 				"role":    "assistant",
-				"content": []map[string]any{{"type": "output_text", "text": outputText.String()}},
+				"id":      messageItemIDSaved,
+				"content": []map[string]any{{"type": "output_text", "text": outputText.String(), "annotations": annotations}},
 				"status":  "completed",
 			})
 		}
@@ -501,6 +536,14 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				if !sendReasoningSummaryDelta(*choice.Delta.ReasoningContent) {
 					sr.Stop(streamErr)
 					return
+				}
+			}
+
+			// Annotations (url_citation from web search).
+			if len(choice.Delta.Annotations) > 0 {
+				var ann []interface{}
+				if err := common.Unmarshal(choice.Delta.Annotations, &ann); err == nil {
+					annotations = append(annotations, ann...)
 				}
 			}
 

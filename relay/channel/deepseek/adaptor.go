@@ -9,6 +9,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	"github.com/QuantumNous/new-api/relay/channel/openai"
@@ -180,6 +181,12 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 		return nil, err
 	}
 	info.IsResponsesConvertedToChat = true
+		// Intercept web search if the upstream doesn't support it natively.
+		if chatReq.WebSearchOptions != nil {
+			if interceptErr := service.ApplyWebSearchInterception(chatReq, info); interceptErr != nil {
+				logger.LogWarn(c, "web_search interception failed: "+interceptErr.Error())
+			}
+		}
 	return chatReq, nil
 }
 

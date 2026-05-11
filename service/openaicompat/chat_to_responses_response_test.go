@@ -454,3 +454,47 @@ func TestChatCompletionsResponseToResponsesResponse_ReasoningOnlyNoContent(t *te
 	require.Len(t, resp.Output[0].Summary, 1)
 	assert.Equal(t, reasoningContent, resp.Output[0].Summary[0].Text)
 }
+
+func TestChatCompletionsResponseToResponsesResponse_IncompleteLength(t *testing.T) {
+	chatResp := &dto.OpenAITextResponse{
+		Id:     "chatcmpl-incomplete",
+		Model:  "gpt-4o",
+		Created: 1700000000,
+		Choices: []dto.OpenAITextResponseChoice{
+			{
+				Index:        0,
+				Message:      dto.Message{Role: "assistant", Content: "partial..."},
+				FinishReason: "length",
+			},
+		},
+		Usage: dto.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15},
+	}
+
+	resp, err := ChatCompletionsResponseToResponsesResponse(chatResp, "resp_inc", nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, `"incomplete"`, string(resp.Status))
+	require.NotNil(t, resp.IncompleteDetails)
+	assert.Equal(t, "max_output_tokens", resp.IncompleteDetails.Reasoning)
+}
+
+func TestChatCompletionsResponseToResponsesResponse_IncompleteContentFilter(t *testing.T) {
+	chatResp := &dto.OpenAITextResponse{
+		Id:     "chatcmpl-filter",
+		Model:  "gpt-4o",
+		Created: 1700000000,
+		Choices: []dto.OpenAITextResponseChoice{
+			{
+				Index:        0,
+				Message:      dto.Message{Role: "assistant", Content: ""},
+				FinishReason: "content_filter",
+			},
+		},
+		Usage: dto.Usage{PromptTokens: 10, CompletionTokens: 0, TotalTokens: 10},
+	}
+
+	resp, err := ChatCompletionsResponseToResponsesResponse(chatResp, "resp_cf", nil, nil)
+	require.NoError(t, err)
+	assert.Equal(t, `"incomplete"`, string(resp.Status))
+	require.NotNil(t, resp.IncompleteDetails)
+	assert.Equal(t, "content_filter", resp.IncompleteDetails.Reasoning)
+}

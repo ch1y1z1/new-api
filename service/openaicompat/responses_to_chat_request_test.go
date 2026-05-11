@@ -455,3 +455,168 @@ func TestConvertResponsesToolChoiceToChatToolChoice_Empty(t *testing.T) {
 	assert.Nil(t, convertResponsesToolChoiceToChatToolChoice(nil))
 	assert.Nil(t, convertResponsesToolChoiceToChatToolChoice(json.RawMessage(``)))
 }
+
+// --- New: json_object response format ---
+
+func TestConvertResponsesTextToResponseFormat_JsonObject(t *testing.T) {
+	text := json.RawMessage(`{"format":{"type":"json_object"}}`)
+	result := convertResponsesTextToResponseFormat(text)
+	require.NotNil(t, result)
+	assert.Equal(t, "json_object", result.Type)
+	assert.Nil(t, result.JsonSchema)
+}
+
+func TestConvertResponsesTextToResponseFormat_Text(t *testing.T) {
+	text := json.RawMessage(`{"format":{"type":"text"}}`)
+	result := convertResponsesTextToResponseFormat(text)
+	assert.Nil(t, result)
+}
+
+// --- New: enforceParameterTypeObject ---
+
+func TestEnforceParameterTypeObject_AddsType(t *testing.T) {
+	params := map[string]any{
+		"properties": map[string]any{"city": map[string]any{"type": "string"}},
+	}
+	result := enforceParameterTypeObject(params)
+	m, ok := result.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "object", m["type"])
+}
+
+func TestEnforceParameterTypeObject_ExistingType(t *testing.T) {
+	params := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}
+	result := enforceParameterTypeObject(params)
+	m, ok := result.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "object", m["type"])
+}
+
+func TestEnforceParameterTypeObject_NonMap(t *testing.T) {
+	result := enforceParameterTypeObject("not a map")
+	assert.Equal(t, "not a map", result)
+}
+
+func TestEnforceParameterTypeObject_Nil(t *testing.T) {
+	result := enforceParameterTypeObject(nil)
+	assert.Nil(t, result)
+}
+
+// --- P1: web_search_preview → web_search_options ---
+
+func TestConvertResponsesToolsToChatTools_WebSearchPreview(t *testing.T) {
+	tools := json.RawMessage(`[
+		{"type":"web_search_preview","search_context_size":"high","user_location":{"type":"approximate","city":"Tokyo"}},
+		{"type":"function","name":"get_weather","description":"Get weather","parameters":{"type":"object"}}
+	]`)
+	chatTools, webSearchOpts := convertResponsesToolsToChatTools(tools)
+	require.Len(t, chatTools, 1)
+	assert.Equal(t, "get_weather", chatTools[0].Function.Name)
+	require.NotNil(t, webSearchOpts)
+	assert.Equal(t, "high", webSearchOpts.SearchContextSize)
+	assert.NotNil(t, webSearchOpts.UserLocation)
+}
+
+func TestConvertResponsesToolsToChatTools_WebSearchPreviewDefault(t *testing.T) {
+	tools := json.RawMessage(`[{"type":"web_search_preview"}]`)
+	chatTools, webSearchOpts := convertResponsesToolsToChatTools(tools)
+	assert.Empty(t, chatTools)
+	require.NotNil(t, webSearchOpts)
+	assert.Equal(t, "medium", webSearchOpts.SearchContextSize)
+}
+
+func TestResponsesRequestToChatCompletionsRequest_WebSearchOptions(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model: "gpt-4o",
+		Input: json.RawMessage(`"latest news"`),
+		Tools: json.RawMessage(`[{"type":"web_search_preview","search_context_size":"low"}]`),
+	}
+	chatReq, err := ResponsesRequestToChatCompletionsRequest(req)
+	require.NoError(t, err)
+	require.NotNil(t, chatReq.WebSearchOptions)
+	assert.Equal(t, "low", chatReq.WebSearchOptions.SearchContextSize)
+}
+
+// --- P3: web_search_call input item ---
+
+func TestResponsesRequestToChatCompletionsRequest_WebSearchCallInput(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{
+		Model: "gpt-4o",
+		Input: json.RawMessage(`[
+			{"type":"input_text","text":"Search for weather"},
+			{"type":"web_search_call","id":"ws_123","status":"completed","query":"weather in Tokyo"},
+			{"type":"message","role":"assistant","content":"The weather in Tokyo is sunny."}
+		]`),
+	}
+	chatReq, err := ResponsesRequestToChatCompletionsRequest(req)
+	require.NoError(t, err)
+	// Should have: user, tool (web_search_call), assistant
+	require.Len(t, chatReq.Messages, 3)
+	assert.Equal(t, "user", chatReq.Messages[0].Role)
+	assert.Equal(t, "tool", chatReq.Messages[1].Role)
+	assert.Equal(t, "ws_123", chatReq.Messages[1].ToolCallId)
+	assert.Contains(t, chatReq.Messages[1].Content, "weather in Tokyo")
+	assert.Equal(t, "assistant", chatReq.Messages[2].Role)
+}
+
+func TestResponsesRequestToChatCompletionsRequest_ReasoningInputItem(t *testing.T) {
+	t.Parallel()
+	// When a "reasoning" input item precedes an assistant message,
+	// its content should be set as ReasoningContent on the assistant message.
+	// The reasoning item itself does NOT become a separate message.
+	req := &dto.OpenAIResponsesRequest{
+		Model: "deepseek-v4-flash",
+		Input: json.RawMessage(`[
+			{"type":"message","role":"user","content":"What is 1+1?"},
+			{"type":"reasoning","id":"rs_abc123","content":[{"type":"reasoning_text","text":"Simple addition: 1+1=2"}]},
+			{"type":"message","role":"assistant","content":"1+1 equals 2."},
+			{"type":"message","role":"user","content":"What is 2+2?"}
+		]`),
+	}
+	chatReq, err := ResponsesRequestToChatCompletionsRequest(req)
+	require.NoError(t, err)
+	require.Len(t, chatReq.Messages, 3)
+	assert.Equal(t, "user", chatReq.Messages[0].Role)
+	assert.Equal(t, "assistant", chatReq.Messages[1].Role)
+	require.NotNil(t, chatReq.Messages[1].ReasoningContent)
+	assert.Equal(t, "Simple addition: 1+1=2", *chatReq.Messages[1].ReasoningContent)
+	assert.Equal(t, "user", chatReq.Messages[2].Role)
+}
+
+func TestResponsesRequestToChatCompletionsRequest_ReasoningSummaryFallback(t *testing.T) {
+	t.Parallel()
+	// When reasoning has no "content" but has "summary", use summary text.
+	req := &dto.OpenAIResponsesRequest{
+		Model: "deepseek-v4-flash",
+		Input: json.RawMessage(`[
+			{"type":"message","role":"user","content":"Hello"},
+			{"type":"reasoning","id":"rs_xyz","summary":[{"type":"summary_text","text":"Greeting the user"}]},
+			{"type":"message","role":"assistant","content":"Hi there!"}
+		]`),
+	}
+	chatReq, err := ResponsesRequestToChatCompletionsRequest(req)
+	require.NoError(t, err)
+	require.Len(t, chatReq.Messages, 2)
+	assert.Equal(t, "assistant", chatReq.Messages[1].Role)
+	require.NotNil(t, chatReq.Messages[1].ReasoningContent)
+	assert.Equal(t, "Greeting the user", *chatReq.Messages[1].ReasoningContent)
+}
+
+func TestResponsesRequestToChatCompletionsRequest_NoReasoningContent(t *testing.T) {
+	t.Parallel()
+	// When there is no reasoning item, ReasoningContent should be nil.
+	req := &dto.OpenAIResponsesRequest{
+		Model: "deepseek-v4-flash",
+		Input: json.RawMessage(`[
+			{"type":"message","role":"user","content":"Hello"},
+			{"type":"message","role":"assistant","content":"Hi there!"}
+		]`),
+	}
+	chatReq, err := ResponsesRequestToChatCompletionsRequest(req)
+	require.NoError(t, err)
+	require.Len(t, chatReq.Messages, 2)
+	assert.Nil(t, chatReq.Messages[1].ReasoningContent)
+}
