@@ -375,3 +375,82 @@ func TestRoundtrip_ToolCallConversation(t *testing.T) {
 	assert.Equal(t, "function_call", resp.Output[1].Type)
 	assert.Equal(t, "get_forecast", resp.Output[1].Name)
 }
+
+func TestChatCompletionsResponseToResponsesResponse_WithReasoning(t *testing.T) {
+	reasoningContent := "Let me think step by step. 15 * 37 = 555."
+	chatResp := &dto.OpenAITextResponse{
+		Id:     "chatcmpl-reasoning",
+		Model:  "deepseek-v4-pro",
+		Created: 1700000000,
+		Choices: []dto.OpenAITextResponseChoice{
+			{
+				Index: 0,
+				Message: dto.Message{
+					Role:             "assistant",
+					Content:          "15 × 37 = 555",
+					ReasoningContent: &reasoningContent,
+				},
+				FinishReason: "stop",
+			},
+		},
+		Usage: dto.Usage{
+			PromptTokens:     11,
+			CompletionTokens: 109,
+			TotalTokens:      120,
+		},
+	}
+
+	resp, err := ChatCompletionsResponseToResponsesResponse(chatResp, "resp_reasoning", nil, nil)
+	require.NoError(t, err)
+
+	// Should have 2 output items: reasoning + message
+	require.Len(t, resp.Output, 2)
+
+	// First item: reasoning
+	assert.Equal(t, "reasoning", resp.Output[0].Type)
+	assert.Equal(t, "completed", resp.Output[0].Status)
+	require.Len(t, resp.Output[0].Summary, 1)
+	assert.Equal(t, "summary_text", resp.Output[0].Summary[0].Type)
+	assert.Equal(t, reasoningContent, resp.Output[0].Summary[0].Text)
+
+	// Second item: message
+	assert.Equal(t, "message", resp.Output[1].Type)
+	assert.Equal(t, "assistant", resp.Output[1].Role)
+	require.Len(t, resp.Output[1].Content, 1)
+	assert.Equal(t, "output_text", resp.Output[1].Content[0].Type)
+	assert.Equal(t, "15 × 37 = 555", resp.Output[1].Content[0].Text)
+}
+
+func TestChatCompletionsResponseToResponsesResponse_ReasoningOnlyNoContent(t *testing.T) {
+	reasoningContent := "Thinking..."
+	chatResp := &dto.OpenAITextResponse{
+		Id:     "chatcmpl-reasoning-only",
+		Model:  "deepseek-v4-pro",
+		Created: 1700000000,
+		Choices: []dto.OpenAITextResponseChoice{
+			{
+				Index: 0,
+				Message: dto.Message{
+					Role:             "assistant",
+					Content:          "",
+					ReasoningContent: &reasoningContent,
+				},
+				FinishReason: "stop",
+			},
+		},
+		Usage: dto.Usage{
+			PromptTokens:     11,
+			CompletionTokens: 50,
+			TotalTokens:      61,
+		},
+	}
+
+	resp, err := ChatCompletionsResponseToResponsesResponse(chatResp, "resp_ro", nil, nil)
+	require.NoError(t, err)
+
+	// Should have reasoning item; message with empty content is omitted
+	require.Len(t, resp.Output, 1)
+	assert.Equal(t, "reasoning", resp.Output[0].Type)
+	require.Len(t, resp.Output[0].Summary, 1)
+	assert.Equal(t, reasoningContent, resp.Output[0].Summary[0].Text)
+}

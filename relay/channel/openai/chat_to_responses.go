@@ -84,6 +84,12 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		sentCreated bool
 		sentStop    bool
 		sawToolCall bool
+		sawReasoning bool
+
+		// Reasoning item tracking.
+		reasoningItemID string
+		reasoningText   strings.Builder
+		summaryIndex    int
 
 		// Assistant message item tracking.
 		messageItemID string
@@ -140,6 +146,9 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		}
 		messageItemID = "msg_" + common.GetRandomString(8)
 		oi := outputIndex
+		if sawReasoning {
+			oi = outputIndex + 1
+		}
 		if !sendEvent("response.output_item.added", map[string]any{
 			"type":        "response.output_item.added",
 			"output_index": oi,
@@ -178,6 +187,9 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		outputText.WriteString(delta)
 		usageText.WriteString(delta)
 		oi := outputIndex
+		if sawReasoning {
+			oi = outputIndex + 1
+		}
 		ci := contentIndex
 		return sendEvent("response.output_text.delta", map[string]any{
 			"type":          "response.output_text.delta",
@@ -191,9 +203,53 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		if delta == "" {
 			return true
 		}
-		// Map reasoning to output_text for broad compatibility.
-		// A future enhancement can emit proper response.reasoning_summary_text.delta events.
-		return sendTextDelta(delta)
+		if !ensureCreated() {
+			return false
+		}
+
+		// Lazily create the reasoning output item + summary part.
+		if reasoningItemID == "" {
+			reasoningItemID = "rs_" + common.GetRandomString(8)
+			sawReasoning = true
+			oi := outputIndex
+			if !sendEvent("response.output_item.added", map[string]any{
+				"type":        "response.output_item.added",
+				"output_index": oi,
+				"item": map[string]any{
+					"type":    "reasoning",
+					"id":      reasoningItemID,
+					"status":  "in_progress",
+					"summary": nil,
+				},
+			}) {
+				return false
+			}
+			si := summaryIndex
+			if !sendEvent("response.reasoning_summary_part.added", map[string]any{
+				"type":          "response.reasoning_summary_part.added",
+				"output_index":  oi,
+				"summary_index": si,
+				"item_id":       reasoningItemID,
+				"part": map[string]any{
+					"type": "summary_text",
+					"text": "",
+				},
+			}) {
+				return false
+			}
+		}
+
+		reasoningText.WriteString(delta)
+		usageText.WriteString(delta)
+		oi := outputIndex
+		si := summaryIndex
+		return sendEvent("response.reasoning_summary_text.delta", map[string]any{
+			"type":          "response.reasoning_summary_text.delta",
+			"output_index":  oi,
+			"summary_index": si,
+			"item_id":       reasoningItemID,
+			"delta":         delta,
+		})
 	}
 
 	sendToolCallItem := func(chatIndex int, callID string, name string, argsDelta string) bool {
@@ -238,9 +294,55 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	}
 
 	sendCompleted := func(finalUsage *dto.Usage) bool {
+		msgOutputIndex := outputIndex
+		if sawReasoning {
+			msgOutputIndex = outputIndex + 1
+		}
+
+		// Close reasoning item if active.
+		if reasoningItemID != "" {
+			oi := outputIndex
+			si := summaryIndex
+			fullText := reasoningText.String()
+			if !sendEvent("response.reasoning_summary_text.done", map[string]any{
+				"type":          "response.reasoning_summary_text.done",
+				"output_index":  oi,
+				"summary_index": si,
+				"item_id":       reasoningItemID,
+				"text":          fullText,
+			}) {
+				return false
+			}
+			if !sendEvent("response.reasoning_summary_part.done", map[string]any{
+				"type":          "response.reasoning_summary_part.done",
+				"output_index":  oi,
+				"summary_index": si,
+				"item_id":       reasoningItemID,
+				"part": map[string]any{
+					"type": "summary_text",
+					"text": fullText,
+				},
+			}) {
+				return false
+			}
+			if !sendEvent("response.output_item.done", map[string]any{
+				"type":        "response.output_item.done",
+				"output_index": oi,
+				"item": map[string]any{
+					"type":    "reasoning",
+					"id":      reasoningItemID,
+					"summary": []map[string]any{{"type": "summary_text", "text": fullText}},
+					"status":  "completed",
+				},
+			}) {
+				return false
+			}
+			reasoningItemID = ""
+		}
+
 		// Close the message content part if active.
 		if messageItemID != "" {
-			oi := outputIndex
+			oi := msgOutputIndex
 			ci := contentIndex
 			if !sendEvent("response.output_text.done", map[string]any{
 				"type":          "response.output_text.done",
@@ -278,6 +380,10 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		}
 
 		// Close function_call items.
+		fcBaseIndex := msgOutputIndex
+		if outputText.Len() > 0 || !sawToolCall {
+			fcBaseIndex++
+		}
 		for chatIdx, itemID := range toolCallItemIDs {
 			args := toolCallArgs[chatIdx]
 			if !sendEvent("response.function_call_arguments.done", map[string]any{
@@ -289,14 +395,14 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			}) {
 				return false
 			}
-			fcOutputIndex := outputIndex + chatIdx + 1
+			fcOutputIndex := fcBaseIndex + chatIdx
 			if !sendEvent("response.output_item.done", map[string]any{
 				"type":        "response.output_item.done",
 				"output_index": fcOutputIndex,
 				"item": map[string]any{
 					"type":      "function_call",
 					"id":        itemID,
-					"call_id":   toolCallCallIDs[chatIdx],
+				"call_id":   toolCallCallIDs[chatIdx],
 					"name":      toolCallNames[chatIdx],
 					"status":    "completed",
 					"arguments": args,
@@ -308,6 +414,14 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 
 		// Build final output items for the completed event.
 		finalOutput := []map[string]any{}
+		if sawReasoning {
+			finalOutput = append(finalOutput, map[string]any{
+				"type":    "reasoning",
+				"id":      "rs_" + common.GetRandomString(8),
+				"summary": []map[string]any{{"type": "summary_text", "text": reasoningText.String()}},
+				"status":  "completed",
+			})
+		}
 		if outputText.Len() > 0 || !sawToolCall {
 			finalOutput = append(finalOutput, map[string]any{
 				"type":    "message",

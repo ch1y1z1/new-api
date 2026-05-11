@@ -79,6 +79,19 @@ func buildResponsesOutputFromChatResponse(resp *dto.OpenAITextResponse) []dto.Re
 
 	var output []dto.ResponsesOutput
 
+	// Reasoning output item (must appear before message per OpenAI spec).
+	reasoningText := msg.GetReasoningContent()
+	if reasoningText != "" {
+		output = append(output, dto.ResponsesOutput{
+			Type:   "reasoning",
+			ID:     "rs_" + common.GetRandomString(8),
+			Status: "completed",
+			Summary: []dto.ResponsesReasoningSummaryPart{
+				{Type: "summary_text", Text: reasoningText},
+			},
+		})
+	}
+
 	// Text message output.
 	if msg.Content != nil {
 		content := buildResponsesContentFromChatContent(msg)
